@@ -12,6 +12,8 @@
 
 const BASE = "https://www.law.go.kr/DRF";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) korean-law-mcp";
+// 법제처는 OC 신청정보에 도메인이 등록되면 Referer 검증을 활성화함 — 등록 도메인을 Referer로 전송
+const REFERER = process.env.LAW_REFERER || "https://korean-law-mcp-five.vercel.app";
 const MAX_OUT = 60000; // 응답 텍스트 상한(문자)
 
 // ---------------------------------------------------------------- utilities
@@ -43,7 +45,7 @@ async function drf(path, params, { timeoutMs = 20000 } = {}) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const r = await fetch(url, { headers: { "User-Agent": UA }, signal: ctrl.signal });
+      const r = await fetch(url, { headers: { "User-Agent": UA, "Referer": REFERER }, signal: ctrl.signal });
       const text = await r.text();
       clearTimeout(timer);
       if (!r.ok) throw new Error(`법제처 API HTTP ${r.status}`);

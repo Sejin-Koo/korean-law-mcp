@@ -52,7 +52,12 @@ async function drf(path, params, { timeoutMs = 20000 } = {}) {
         // HTML이 오면 대상/파라미터 오류이거나 OC 미등록
         throw new Error(`법제처 API가 JSON이 아닌 응답을 반환했습니다(파라미터 또는 OC 확인 필요). 앞부분: ${trimmed.replace(/\s+/g, " ").slice(0, 160)}`);
       }
-      return JSON.parse(trimmed);
+      const parsed = JSON.parse(trimmed);
+      // 법제처 오류 응답({result, msg})을 0건으로 오인하지 않도록 명시적 오류로 변환
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.msg && parsed.result && Object.keys(parsed).length <= 3) {
+        throw new Error(`법제처 API 오류: ${parsed.result} ${parsed.msg} — OC가 유효하지 않거나(신청정보 수정 직후 재승인 대기 등) 파라미터 오류일 수 있습니다.`);
+      }
+      return parsed;
     } catch (e) {
       clearTimeout(timer);
       if (attempt === 1) throw e;

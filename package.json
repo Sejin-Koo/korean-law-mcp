@@ -1,0 +1,6 @@
+{
+  "name": "korean-law-mcp",
+  "version": "1.0.0",
+  "description": "법제처 국가법령정보 Open API MCP server (self-hosted, own OC)",
+  "type": "module"
+}

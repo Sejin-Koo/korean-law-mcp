@@ -126,26 +126,104 @@ async function searchWithRelax(target, query, extra, listPath) {
  * 뒤로 가고(실측: 56건 중 34번째), display 기본값 10건 안에 들어오지 못해
  * 에러 없이 조용히 누락된다. 완전일치 > 접두일치 > 부분일치 순으로 끌어올린다.
  */
-const normName = (s) => String(s || "").replace(/\s+/g, "").toLowerCase();
+// 영문법령(elaw) 등 일부 target은 검색어에 <strong> 하이라이트 태그를 끼워 반환하므로 먼저 제거한다.
+const normName = (s) => strip(s).replace(/\s+/g, "").toLowerCase();
 
-function nameMatchRank(item, q) {
+/** fields는 우선순위 순(앞쪽 필드에서 일치할수록 상위). 0~9=완전일치, 10~19=접두일치, 20~29=부분일치 */
+function nameMatchRank(item, q, fields) {
   const nq = normName(q);
-  if (!nq) return 9;
-  const full = normName(item["법령명한글"]);
-  const abbr = normName(item["법령약칭명"]);
-  if (full === nq) return 0;
-  if (abbr && abbr === nq) return 1;
-  if (full.startsWith(nq)) return 2;
-  if (abbr && abbr.startsWith(nq)) return 3;
-  return 4;
+  if (!nq) return 99;
+  let best = 99;
+  fields.forEach((f, i) => {
+    const n = normName(item[f]);
+    if (!n) return;
+    if (n === nq) best = Math.min(best, i);
+    else if (n.startsWith(nq)) best = Math.min(best, 10 + i);
+    else if (n.includes(nq)) best = Math.min(best, 20 + i);
+  });
+  return best;
 }
 
 /** 원래 순서를 보존하는 안정 정렬(같은 등급 안에서는 법제처 반환 순서 유지) */
-function rerankByName(items, q) {
+function rerankByName(items, q, fields) {
   return items
-    .map((x, i) => ({ x, i, r: nameMatchRank(x, q) }))
+    .map((x, i) => ({ x, i, r: nameMatchRank(x, q, fields) }))
     .sort((a, b) => a.r - b.r || a.i - b.i)
     .map((e) => e.x);
+}
+
+/**
+ * 이름 기반 검색 도구 공통 처리.
+ * 넉넉히(100건) 받아 완전일치 우선으로 재정렬한 뒤 요청한 display 건수로 잘라 준다.
+ */
+async function nameSearch({ target, query, extra = {}, listPath, fields, display, label = "항목" }) {
+  const want = Math.min(display || 10, 100);
+  const wide = want < 100;
+  const { items: rawItems, root, note } = await searchWithRelax(
+    target, query, { ...extra, display: wide ? 100 : want }, listPath
+  );
+  if (!rawItems.length) return { items: [], root, note, rerankNote: "" };
+  const sorted = rerankByName(rawItems, query, fields);
+  const items = wide ? sorted.slice(0, want) : sorted;
+  let rerankNote = "";
+  const promoted = items.filter((x) => rawItems.indexOf(x) >= items.length);
+  if (promoted.length) {
+    rerankNote =
+      `※ 법제처 검색은 부분일치 + 이름 가나다순이라 검색어와 정확히 일치하는 항목(${label})이 뒤로 밀립니다. ` +
+      `"${query}"에 더 가깝게 일치하는 ${promoted.length}건을 앞으로 재정렬했습니다.\n\n`;
+  }
+  const total = Number(root.totalCnt) || 0;
+  // 접두일치조차 없으면(>19) 완전일치가 100건 밖에 있을 수 있으므로 경고
+  if (wide && total > 100 && nameMatchRank(items[0], query, fields) > 19) {
+    rerankNote +=
+      `※ 총 ${total}건 중 앞 100건만 확인했고 그 안에 이름이 "${query}"로 시작하는 항목(${label})이 없습니다. ` +
+      `검색어를 더 구체적으로 바꾸거나 display를 100으로 지정해 확인하세요.\n\n`;
+  }
+  return { items, root, note, rerankNote };
+}
+
+// ---------------------------------------------------------------- 판례·결정례 랭킹
+
+/** "2016.7.18." / "20240712" → 20160718 형태의 비교용 정수 */
+function dateKey(s) {
+  const m = String(s || "").match(/(\d{4})\D*(\d{1,2})\D*(\d{1,2})/);
+  return m ? Number(m[1]) * 10000 + Number(m[2]) * 100 + Number(m[3]) : 0;
+}
+
+/**
+ * 판례의 법원명 판정.
+ * 법제처 판례 DB에는 출처가 다른 두 계열이 섞여 있고, 국세법령정보시스템 계열은
+ * 법원명 필드가 비어 있는 대신 사건번호가 "대법원-2024-다-233854" 형태다.
+ * 그래서 curt(법원명) 파라미터를 API에 그대로 넘기면 이 계열이 통째로 탈락한다
+ * (실측: "중간배당" 전체 10건 → curt=대법원 0건, 그중 2건이 실제 대법원 사건).
+ */
+function courtOf(x) {
+  const n = String(x["법원명"] || "").trim();
+  if (n) return n;
+  const m = String(x["사건번호"] || "").match(/^([가-힣]+법원)/);
+  return m ? m[1] : "";
+}
+
+/** 사건번호 정규화 — "대법원-2024-다-233854"와 "2024다233854"를 같은 건으로 본다 */
+function caseKey(x) {
+  return String(x["사건번호"] || "").replace(/^[가-힣]+법원-/, "").replace(/[\s\-·]/g, "");
+}
+
+/** 법원 위계(대법원>고법·특허>그 밖의 법원>불명) + 전원합의체 가산 */
+function precRank(x) {
+  const c = courtOf(x);
+  let tier = 3;
+  if (/대법원/.test(c)) tier = 0;
+  else if (/고등법원|특허법원/.test(c)) tier = 1;
+  else if (/법원/.test(c)) tier = 2;
+  const plenary = /전원합의체/.test(`${x["사건명"] || ""}${x["판결유형"] || ""}${x["선고"] || ""}`);
+  return tier * 2 + (plenary ? 0 : 1);
+}
+
+/** 검색어 토큰 중 제목에 포함된 개수(많을수록 상위) */
+function tokenCoverage(title, q) {
+  const t = normName(title);
+  return String(q).trim().split(/\s+/).filter((tk) => tk && t.includes(normName(tk))).length;
 }
 
 // ---------------------------------------------------------------- tools
@@ -183,10 +261,11 @@ const TOOLS = [
       );
       if (!raw.length) return `"${a.query}" 검색 결과가 없습니다. (총 ${root.totalCnt || 0}건)`;
 
+      const LAW_FIELDS = ["법령명한글", "법령약칭명"];
       let items = raw;
       let rerankNote = "";
       if (mode === 1) {
-        const sorted = rerankByName(raw, a.query);
+        const sorted = rerankByName(raw, a.query, LAW_FIELDS);
         items = wide ? sorted.slice(0, want) : sorted;
         const promoted = items.filter((x) => raw.indexOf(x) >= items.length);
         if (promoted.length) {
@@ -195,7 +274,7 @@ const TOOLS = [
             `완전일치·접두일치 ${promoted.length}건을 앞으로 재정렬했습니다.\n\n`;
         }
         const total = Number(root.totalCnt) || 0;
-        if (wide && total > 100 && nameMatchRank(items[0], a.query) > 1) {
+        if (wide && total > 100 && nameMatchRank(items[0], a.query, LAW_FIELDS) > 9) {
           rerankNote +=
             `※ 총 ${total}건 중 앞 100건만 확인했고 그 안에 완전일치 법령이 없습니다. ` +
             `검색어를 더 구체적으로 바꾸거나 page를 넘겨 확인하세요.\n\n`;
@@ -287,16 +366,17 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { items, root, note } = await searchWithRelax(
-        "admrul", a.query, { display: Math.min(a.display || 10, 100) }, (r) => r.admrul
-      );
+      const { items, root, note, rerankNote } = await nameSearch({
+        target: "admrul", query: a.query, display: a.display,
+        fields: ["행정규칙명"], label: "행정규칙", listPath: (r) => r.admrul,
+      });
       if (!items.length) return `"${a.query}" 행정규칙 검색 결과가 없습니다.`;
       const lines = items.map((x) =>
         `${x["행정규칙명"]} (${x["행정규칙종류"] || ""})\n` +
         `  행정규칙일련번호(본문조회용): ${x["행정규칙일련번호"]} | 행정규칙ID(본문조회에 사용 금지): ${x["행정규칙ID"] || "-"}\n` +
         `  소관: ${x["소관부처명"]} | 발령 ${fmtDate(x["발령일자"])} | 시행 ${fmtDate(x["시행일자"])} | ${x["현행연혁구분"] || ""}`
       );
-      return note + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + rerankNote + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -337,7 +417,7 @@ const TOOLS = [
   },
   {
     name: "search_precedent",
-    description: "법원 판례 검색(대법원·하급심). 사건번호를 알면 case_number로 정확 조회. 키워드는 AND 조건이므로 2~3단어 권장(0건이면 자동으로 완화 재검색). 본문은 결과의 판례일련번호로 get_precedent 호출.",
+    description: "법원 판례 검색(대법원·하급심). 사건번호를 알면 case_number로 정확 조회. 키워드는 AND 조건이므로 2~3단어 권장(0건이면 자동으로 완화 재검색). 본문은 결과의 판례일련번호로 get_precedent 호출. court(법원명) 필터는 법제처 API에 넘기지 않고 서버가 사건번호·법원명 양쪽으로 판정해 거르므로, 법원명 필드가 비어 있는 국세법령정보시스템 계열 판례도 누락되지 않는다. 결과는 법원 위계(대법원>고법>그 밖) → 전원합의체 → 선고일 최신 순으로 정렬되고 같은 사건번호는 1건으로 합친다.",
     inputSchema: {
       type: "object",
       properties: {
@@ -350,8 +430,9 @@ const TOOLS = [
     },
     handler: async (a) => {
       if (!a.query && !a.case_number) throw new Error("query 또는 case_number 중 하나는 필수입니다.");
-      const extra = { display: Math.min(a.display || 10, 100) };
-      if (a.court) extra.curt = a.court;
+      const want = Math.min(a.display || 10, 100);
+      // court는 curt로 넘기지 않는다 — 법원명이 빈 계열이 통째로 탈락하므로 아래에서 로컬 판정한다.
+      const extra = { display: 100 };
       if (a.search) extra.search = a.search;
       let root, items, note = "";
       if (a.case_number) {
@@ -361,12 +442,49 @@ const TOOLS = [
       } else {
         ({ root, items, note } = await searchWithRelax("prec", a.query, extra, (r) => r.prec));
       }
-      if (!items.length) return `판례 검색 결과가 없습니다. (키워드를 2~3단어로 줄이거나 case_number로 조회해 보세요. 그래도 없으면 '관련 판례를 찾지 못함'으로 처리하고 판례를 지어내지 마세요.)`;
-      const lines = items.map((x) =>
-        `${x["법원명"]} ${fmtDate(x["선고일자"])} ${x["선고"] || ""} ${x["사건번호"]} (${x["사건종류명"] || ""}, ${x["판결유형"] || ""})\n` +
-        `  사건명: ${x["사건명"]}\n  판례일련번호(본문조회용): ${x["판례일련번호"]}`
+      const fetched = items.length;
+
+      // ① 법원 필터를 로컬 판정으로 적용
+      let filterNote = "";
+      if (a.court) {
+        const key = String(a.court).trim();
+        const kept = items.filter((x) => courtOf(x).includes(key));
+        const rescued = kept.filter((x) => !String(x["법원명"] || "").trim()).length;
+        items = kept;
+        if (rescued) {
+          filterNote = `※ 법원명 필드가 비어 있어 법제처 API 필터로는 탈락했을 판례 ${rescued}건을 사건번호로 판정해 포함했습니다.\n\n`;
+        }
+      }
+      // ② 사건번호 기준 중복 제거
+      const seen = new Set();
+      const deduped = [];
+      let dupCount = 0;
+      for (const x of items) {
+        const k = caseKey(x) || `#${x["판례일련번호"]}`;
+        if (seen.has(k)) { dupCount++; continue; }
+        seen.add(k);
+        deduped.push(x);
+      }
+      // ③ 법원 위계 → 전원합의체 → 선고일 최신 순
+      const ranked = deduped
+        .map((x, i) => ({ x, i, r: precRank(x), d: dateKey(x["선고일자"]) }))
+        .sort((p, q) => p.r - q.r || q.d - p.d || p.i - q.i)
+        .map((e) => e.x);
+      const shown = ranked.slice(0, want);
+
+      if (!shown.length) {
+        return a.court
+          ? `"${a.court}" 판례를 찾지 못했습니다. (검색 자체는 ${fetched}건이 나왔으나 법원 필터에서 모두 제외됨 — court 없이 다시 조회해 보세요.)`
+          : `판례 검색 결과가 없습니다. (키워드를 2~3단어로 줄이거나 case_number로 조회해 보세요. 그래도 없으면 '관련 판례를 찾지 못함'으로 처리하고 판례를 지어내지 마세요.)`;
+      }
+      const dupNote = dupCount ? `※ 사건번호가 같은 중복 ${dupCount}건을 합쳤습니다.\n\n` : "";
+      const lines = shown.map((x) =>
+        `${courtOf(x) || "(법원명 미표기)"} ${fmtDate(x["선고일자"])} ${x["선고"] || ""} ${x["사건번호"]} (${x["사건종류명"] || ""}${x["판결유형"] ? `, ${x["판결유형"]}` : ""})\n` +
+        `  사건명: ${x["사건명"]}\n` +
+        `  판례일련번호(본문조회용): ${x["판례일련번호"]} | 출처: ${x["데이터출처명"] || "-"}`
       );
-      return note + `총 ${root.totalCnt || items.length}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + filterNote + dupNote +
+        `총 ${root.totalCnt || fetched}건 중 ${shown.length}건 (법원 위계 → 선고일 최신 순)\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -402,12 +520,20 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { items, root, note } = await searchWithRelax("expc", a.query, { display: Math.min(a.display || 10, 100) }, (r) => r.expc);
-      if (!items.length) return `"${a.query}" 법령해석례 검색 결과가 없습니다.`;
+      const want = Math.min(a.display || 10, 100);
+      const { items: raw, root, note } = await searchWithRelax("expc", a.query, { display: 100 }, (r) => r.expc);
+      if (!raw.length) return `"${a.query}" 법령해석례 검색 결과가 없습니다.`;
+      // 안건명은 "OO시 - 「법률」 제N조(질의요지) 관련" 형식이라 완전일치가 무의미 —
+      // 검색어 토큰 커버리지 → 회신일 최신 순으로 정렬한다.
+      const items = raw
+        .map((x, i) => ({ x, i, c: tokenCoverage(x["안건명"], a.query), d: dateKey(x["회신일자"]) }))
+        .sort((p, q) => q.c - p.c || q.d - p.d || p.i - q.i)
+        .map((e) => e.x)
+        .slice(0, want);
       const lines = items.map((x) =>
-        `${x["안건명"]}\n  안건번호 ${x["안건번호"] || "-"} | 해석기관 ${x["해석기관명"] || "-"} | 회신 ${fmtDate(x["회신일자"])}\n  법령해석례일련번호(본문조회용): ${x["법령해석례일련번호"]}`
+        `${x["안건명"]}\n  안건번호 ${x["안건번호"] || "-"} | 해석기관 ${x["해석기관명"] || x["회신기관명"] || "-"} | 회신 ${fmtDate(x["회신일자"])}\n  법령해석례일련번호(본문조회용): ${x["법령해석례일련번호"]}`
       );
-      return note + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + `총 ${root.totalCnt}건 중 ${items.length}건 (검색어 적합도 → 회신일 최신 순)\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -439,7 +565,10 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { items, root, note } = await searchWithRelax("licbyl", a.query, { display: Math.min(a.display || 10, 100) }, (r) => r.licbyl);
+      const { items, root, note, rerankNote } = await nameSearch({
+        target: "licbyl", query: a.query, display: a.display,
+        fields: ["별표명", "관련법령명"], label: "별표·서식", listPath: (r) => r.licbyl,
+      });
       if (!items.length) return `"${a.query}" 별표·서식 검색 결과가 없습니다.`;
       const lines = items.map((x) =>
         `[${x["별표종류"] || ""}${x["별표번호"] ? ` 제${Number(x["별표번호"].slice(0, 4))}호${Number(x["별표번호"].slice(4)) ? `의${Number(x["별표번호"].slice(4))}` : ""}` : ""}] ${x["별표명"] || ""} — ${x["관련법령명"]}\n` +
@@ -447,7 +576,7 @@ const TOOLS = [
         (x["별표서식파일링크"] ? `\n  HWP: https://www.law.go.kr${x["별표서식파일링크"]}` : "") +
         (x["별표서식PDF파일링크"] ? ` | PDF: https://www.law.go.kr${x["별표서식PDF파일링크"]}` : "")
       );
-      return note + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + rerankNote + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -462,13 +591,16 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { items, root, note } = await searchWithRelax("ordin", a.query, { display: Math.min(a.display || 10, 100) }, (r) => r.law);
+      const { items, root, note, rerankNote } = await nameSearch({
+        target: "ordin", query: a.query, display: a.display,
+        fields: ["자치법규명"], label: "자치법규", listPath: (r) => r.law,
+      });
       if (!items.length) return `"${a.query}" 자치법규 검색 결과가 없습니다.`;
       const lines = items.map((x) =>
         `${x["자치법규명"]} (${x["자치법규종류"] || ""}) — ${x["지자체기관명"] || ""}\n` +
         `  자치법규ID ${x["자치법규ID"]} | 공포 ${fmtDate(x["공포일자"])} | 시행 ${fmtDate(x["시행일자"])}`
       );
-      return note + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + rerankNote + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -483,12 +615,18 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { items, root, note } = await searchWithRelax("detc", a.query, { display: Math.min(a.display || 10, 100) }, (r) => r.Detc || r.detc);
-      if (!items.length) return `"${a.query}" 헌재결정례 검색 결과가 없습니다.`;
+      const want = Math.min(a.display || 10, 100);
+      const { items: raw, root, note } = await searchWithRelax("detc", a.query, { display: 100 }, (r) => r.Detc || r.detc);
+      if (!raw.length) return `"${a.query}" 헌재결정례 검색 결과가 없습니다.`;
+      const items = raw
+        .map((x, i) => ({ x, i, c: tokenCoverage(x["사건명"], a.query), d: dateKey(x["종국일자"]) }))
+        .sort((p, q) => q.c - p.c || q.d - p.d || p.i - q.i)
+        .map((e) => e.x)
+        .slice(0, want);
       const lines = items.map((x) =>
         `${x["사건명"] || ""}\n  ${x["사건번호"] || ""} | 종국일자 ${fmtDate(x["종국일자"])} | 헌재결정례일련번호: ${x["헌재결정례일련번호"] || x["헌재결정례ID"] || "-"}`
       );
-      return note + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + `총 ${root.totalCnt}건 중 ${items.length}건 (검색어 적합도 → 종국일 최신 순)\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -506,18 +644,26 @@ const TOOLS = [
     handler: async (a) => {
       const target = COMMITTEE[a.source];
       if (!target) throw new Error(`알 수 없는 source: ${a.source}`);
-      const { items, root, note } = await searchWithRelax(target, a.query, { display: Math.min(a.display || 10, 100) }, (r) => {
+      const want = Math.min(a.display || 10, 100);
+      const { items: raw, root, note } = await searchWithRelax(target, a.query, { display: 100 }, (r) => {
         for (const k of Object.keys(r)) if (Array.isArray(r[k]) || (r[k] && typeof r[k] === "object" && r[k]["사건번호"])) return r[k];
         return r[target] || r[target.toLowerCase()] || r[cap(target)];
       });
-      if (!items.length) return `"${a.query}" ${a.source} 결정례 검색 결과가 없습니다.`;
+      if (!raw.length) return `"${a.query}" ${a.source} 결정례 검색 결과가 없습니다.`;
+      const dateOf = (x) => x["의결일자"] || x["결정일자"] || x["재결일자"] || x["처분일자"] || "";
+      const titleOf = (x) => x["사건명"] || x["안건명"] || x["제목"] || "";
+      // 안건명이 "OO의 OO 위반행위에 대한 건" 형식이라 완전일치가 무의미하고,
+      // 법제처 기본 정렬이 안건명 가나다순이라 최신 결정례가 뒤로 밀린다 → 일자 최신 우선.
+      const items = raw
+        .map((x, i) => ({ x, i, d: dateKey(dateOf(x)), p: /전\s*원/.test(String(x["회의종류"] || "")) ? 0 : 1 }))
+        .sort((m, n) => n.d - m.d || m.p - n.p || m.i - n.i)
+        .map((e) => e.x)
+        .slice(0, want);
       const lines = items.map((x) => {
         const serialKey = Object.keys(x).find((k) => k.endsWith("일련번호"));
-        const title = x["사건명"] || x["안건명"] || x["제목"] || "";
-        const date = x["의결일자"] || x["결정일자"] || x["재결일자"] || x["처분일자"] || "";
-        return `${title}\n  사건번호 ${x["사건번호"] || "-"} | ${x["재결청"] || x["회의종류"] || x["기관명"] || ""} | 일자 ${fmtDate(date)}\n  일련번호(본문조회용): ${serialKey ? x[serialKey] : "-"}`;
+        return `${titleOf(x)}\n  사건번호 ${x["사건번호"] || "-"} | ${x["재결청"] || x["회의종류"] || x["기관명"] || ""} | 일자 ${fmtDate(dateOf(x))}\n  일련번호(본문조회용): ${serialKey ? x[serialKey] : "-"}`;
       });
-      return note + `총 ${root.totalCnt || items.length}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + `총 ${root.totalCnt || raw.length}건 중 ${items.length}건 (일자 최신 순)\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -565,14 +711,15 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const data = await drf("lawSearch.do", { target: "elaw", query: a.query, display: Math.min(a.display || 10, 100) });
-      const root = data.LawSearch || {};
-      const items = arr(root.law);
+      const { items, root, note, rerankNote } = await nameSearch({
+        target: "elaw", query: a.query, display: a.display,
+        fields: ["법령명한글", "법령명영문", "법령약칭명"], label: "영문법령", listPath: (r) => r.law,
+      });
       if (!items.length) return `"${a.query}" 영문법령 검색 결과가 없습니다.`;
       const lines = items.map((x) =>
-        `${x["법령명한글"] || ""} / ${x["법령명영문"] || ""}\n  MST ${x["법령일련번호"]} | 공포 ${fmtDate(x["공포일자"])} | 시행 ${fmtDate(x["시행일자"])}`
+        `${strip(x["법령명한글"])} / ${strip(x["법령명영문"])}\n  MST ${x["법령일련번호"]} | 공포 ${fmtDate(x["공포일자"])} | 시행 ${fmtDate(x["시행일자"])}`
       );
-      return `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + rerankNote + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
     },
   },
   {
@@ -587,12 +734,15 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { items, root, note } = await searchWithRelax("trty", a.query, { display: Math.min(a.display || 10, 100) }, (r) => r.Trty || r.trty);
+      const { items, root, note, rerankNote } = await nameSearch({
+        target: "trty", query: a.query, display: a.display,
+        fields: ["조약명", "조약명한글"], label: "조약", listPath: (r) => r.Trty || r.trty,
+      });
       if (!items.length) return `"${a.query}" 조약 검색 결과가 없습니다.`;
       const lines = items.map((x) =>
         `${x["조약명"] || x["조약명한글"] || ""}\n  조약번호 ${x["조약번호"] || "-"} | 발효 ${fmtDate(x["발효일자"])} | 조약일련번호 ${x["조약일련번호"] || "-"}`
       );
-      return note + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
+      return note + rerankNote + `총 ${root.totalCnt}건 중 ${items.length}건\n\n` + lines.join("\n\n");
     },
   },
   {

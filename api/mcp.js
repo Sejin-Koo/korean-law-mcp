@@ -118,6 +118,36 @@ async function searchWithRelax(target, query, extra, listPath) {
   return { root, items, note };
 }
 
+/**
+ * 법령명 검색(search=1) 결과 재정렬용.
+ *
+ * 법제처 lawSearch는 법령명 검색을 "부분일치 + 법령명 가나다순"으로 처리한다.
+ * 그래서 "상법"처럼 짧은 검색어는 "보상법·배상법·기상법·형사보상법" 등에 밀려
+ * 뒤로 가고(실측: 56건 중 34번째), display 기본값 10건 안에 들어오지 못해
+ * 에러 없이 조용히 누락된다. 완전일치 > 접두일치 > 부분일치 순으로 끌어올린다.
+ */
+const normName = (s) => String(s || "").replace(/\s+/g, "").toLowerCase();
+
+function nameMatchRank(item, q) {
+  const nq = normName(q);
+  if (!nq) return 9;
+  const full = normName(item["법령명한글"]);
+  const abbr = normName(item["법령약칭명"]);
+  if (full === nq) return 0;
+  if (abbr && abbr === nq) return 1;
+  if (full.startsWith(nq)) return 2;
+  if (abbr && abbr.startsWith(nq)) return 3;
+  return 4;
+}
+
+/** 원래 순서를 보존하는 안정 정렬(같은 등급 안에서는 법제처 반환 순서 유지) */
+function rerankByName(items, q) {
+  return items
+    .map((x, i) => ({ x, i, r: nameMatchRank(x, q) }))
+    .sort((a, b) => a.r - b.r || a.i - b.i)
+    .map((e) => e.x);
+}
+
 // ---------------------------------------------------------------- tools
 
 const COMMITTEE = {
@@ -129,7 +159,7 @@ const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const TOOLS = [
   {
     name: "search_law",
-    description: "현행 법령(법률·대통령령·부령 등) 검색. 법령명 또는 본문 키워드로 검색해 MST(법령일련번호)·법령ID·시행일·공포일을 반환. 조문 본문이 필요하면 결과의 MST로 get_law_text를 호출.",
+    description: "현행 법령(법률·대통령령·부령 등) 검색. 법령명 또는 본문 키워드로 검색해 MST(법령일련번호)·법령ID·시행일·공포일을 반환. 조문 본문이 필요하면 결과의 MST로 get_law_text를 호출. 법제처 법령명 검색은 부분일치(예: '상법'이 '보상법·배상법'에도 걸림) + 가나다순이므로, 이 서버가 1페이지 요청에 한해 완전일치·접두일치를 앞으로 자동 재정렬해 반환한다.",
     inputSchema: {
       type: "object",
       properties: {
@@ -141,18 +171,43 @@ const TOOLS = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { items, root, note } = await searchWithRelax(
+      const mode = a.search || 1;
+      const want = Math.min(a.display || 10, 100);
+      const page = a.page || 1;
+      // 법령명 검색 1페이지는 넉넉히(100건) 받아 완전일치 우선으로 재정렬한 뒤 잘라 준다.
+      const wide = mode === 1 && page === 1 && want < 100;
+      const { items: raw, root, note } = await searchWithRelax(
         "law", a.query,
-        { search: a.search || 1, display: Math.min(a.display || 10, 100), page: a.page || 1 },
+        { search: mode, display: wide ? 100 : want, page },
         (r) => r.law
       );
-      if (!items.length) return `"${a.query}" 검색 결과가 없습니다. (총 ${root.totalCnt || 0}건)`;
+      if (!raw.length) return `"${a.query}" 검색 결과가 없습니다. (총 ${root.totalCnt || 0}건)`;
+
+      let items = raw;
+      let rerankNote = "";
+      if (mode === 1) {
+        const sorted = rerankByName(raw, a.query);
+        items = wide ? sorted.slice(0, want) : sorted;
+        const promoted = items.filter((x) => raw.indexOf(x) >= items.length);
+        if (promoted.length) {
+          rerankNote =
+            `※ 법제처 법령명 검색은 부분일치·가나다순이라 "${a.query}"에 정확히 대응하는 법령이 뒤로 밀립니다. ` +
+            `완전일치·접두일치 ${promoted.length}건을 앞으로 재정렬했습니다.\n\n`;
+        }
+        const total = Number(root.totalCnt) || 0;
+        if (wide && total > 100 && nameMatchRank(items[0], a.query) > 1) {
+          rerankNote +=
+            `※ 총 ${total}건 중 앞 100건만 확인했고 그 안에 완전일치 법령이 없습니다. ` +
+            `검색어를 더 구체적으로 바꾸거나 page를 넘겨 확인하세요.\n\n`;
+        }
+      }
+
       const lines = items.map((x) =>
         `${statusLabel(x["시행일자"], x["현행연혁코드"])} ${x["법령명한글"]}${x["법령약칭명"] ? ` (약칭: ${x["법령약칭명"]})` : ""}\n` +
         `  MST(법령일련번호): ${x["법령일련번호"]} | 법령ID: ${x["법령ID"]} | ${x["법령구분명"]} | 소관: ${x["소관부처명"]}\n` +
         `  공포 ${fmtDate(x["공포일자"])} (${x["제개정구분명"]}, 공포번호 ${x["공포번호"]}) / 시행 ${fmtDate(x["시행일자"])}`
       );
-      return note + `총 ${root.totalCnt}건 중 ${items.length}건 (조회기준일 ${fmtDate(todayKST())})\n\n` + lines.join("\n\n");
+      return note + rerankNote + `총 ${root.totalCnt}건 중 ${items.length}건 (조회기준일 ${fmtDate(todayKST())})\n\n` + lines.join("\n\n");
     },
   },
   {

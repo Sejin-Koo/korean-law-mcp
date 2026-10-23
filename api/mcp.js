@@ -291,19 +291,20 @@ const TOOLS = [
   },
   {
     name: "get_law_text",
-    description: "법령 조문 원문 조회. mst(권장, search_law의 MST) 또는 law_id로 조회. jo에 조번호를 주면 해당 조문만, 생략하면 조문 목차를 반환. 본문은 시행일법령 기준이라 먼저 공포됐지만 시행이 늦은 판이 현행일 때도 그 사이 신설·개정 조문이 반영된다. 현행/연혁/시행예정을 연혁 목록으로 판정해 표기하고, 연혁 버전이면 현행 MST를 함께 안내.",
+    description: "법령 조문 원문 조회. mst(권장, search_law의 MST) 또는 law_id로 조회. jo에 조번호를 주면 해당 조문만, 생략하면 조문 목차를 반환. jo='부칙'(또는 '부칙 <공포번호|공포일>')이면 부칙(시행일·경과조치)을 반환. 본문은 시행일법령 기준이라 먼저 공포됐지만 시행이 늦은 판이 현행일 때도 그 사이 신설·개정 조문이 반영된다. 현행/연혁/시행예정을 연혁 목록으로 판정해 표기하고, 연혁 버전이면 현행 MST를 함께 안내.",
     inputSchema: {
       type: "object",
       properties: {
         mst: { type: "string", description: "법령일련번호(MST) — search_law 결과의 MST. 특정 시점 버전을 가리킴(권장)" },
         law_id: { type: "string", description: "법령ID — MST가 없을 때 사용(항상 현행 기준)" },
-        jo: { type: "string", description: "조번호 (예: '제38조', '38', '10의2'). 생략 시 조문 목차 반환" },
+        jo: { type: "string", description: "조번호 (예: '제38조', '38', '10의2'). 생략 시 조문 목차 반환. '부칙'이면 최근 부칙 3건 본문과 전체 부칙 목록, '부칙 21448'(공포번호)·'부칙 2026.3.6'(공포일)이면 그 부칙만(경과조치·시행일 단서 확인용)" },
         full: { type: "boolean", description: "true면 jo 없이도 전체 조문 본문 반환(응답이 매우 클 수 있음)" },
       },
     },
     handler: async (a) => {
       if (!a.mst && !a.law_id) throw new Error("mst 또는 law_id 중 하나는 필수입니다. search_law로 먼저 MST를 확인하세요.");
-      const jo = normalizeJo(a.jo);
+      const addenda = parseAddendaQuery(a.jo);
+      const jo = addenda ? undefined : normalizeJo(a.jo);
       const { law, source, label, note } = await resolveLawText({ mst: a.mst, lawId: a.law_id, jo });
       const basic = law["기본정보"] || {};
       const efYd = String(basic["시행일자"] || basic["조문별시행일자"] || "").replace(/[^0-9]/g, "");
@@ -316,6 +317,7 @@ const TOOLS = [
         (note ? `\n${note}` : "") +
         (source === "law" ? "\n※ 시행일법령 본문 조회에 실패해 현행법령 API 본문으로 대신 응답했습니다. 나중에 공포된 개정 조문이 빠져 있을 수 있으니 get_law_history로 개정 이력을 함께 확인하세요." : "") +
         "\n\n";
+      if (addenda) return clip(head + renderAddenda(law, addenda));
       const units = arr((law["조문"] || {})["조문단위"]);
       if (!units.length) {
         return head + (jo
@@ -853,6 +855,49 @@ async function resolveLawText({ mst, lawId, jo }) {
     } catch (_) { /* 폴백 */ }
   }
   return { law: law0, source: "law", label, note };
+}
+
+/**
+ * 부칙 조회. 조문 API는 부칙을 조문 단위로 주지 않지만 본문 응답의 "부칙.부칙단위"에 공포 회차별로 들어 있다.
+ * 경과조치(예: 상법 제21448호 부칙 제2조 — 기존 자기주식 소각 유예)는 여기에만 있으므로 2차 출처로 대신하지 않게 한다.
+ * jo 표기: "부칙"(최근 3건 + 목록) / "부칙 21448"(공포번호) / "부칙 2026.3.6"·"부칙 20260306"(공포일)
+ */
+function parseAddendaQuery(jo) {
+  if (jo === undefined || jo === null) return null;
+  const s = String(jo).trim();
+  if (!/^부칙/.test(s)) return null;
+  const rest = s.replace(/^부칙\s*/, "").replace(/^[<(]|[>)]$/g, "").trim();
+  if (!rest) return { latest: 3 };
+  const digits = rest.replace(/[^0-9]/g, "");
+  if (/[.\-]/.test(rest) || digits.length === 8) {
+    const parts = rest.split(/[.\-\s]+/).filter(Boolean);
+    const d = parts.length >= 3 ? parts[0].padStart(4, "0") + parts[1].padStart(2, "0") + parts[2].padStart(2, "0") : digits;
+    return { date: d };
+  }
+  return { no: digits.replace(/^제|호$/g, "") };
+}
+
+function flattenText(x) {
+  if (x === undefined || x === null) return [];
+  if (Array.isArray(x)) return x.flatMap(flattenText);
+  if (typeof x === "object") return flattenText(x.content ?? Object.values(x));
+  return [strip(String(x))];
+}
+
+function renderAddenda(law, q) {
+  const units = arr((law["부칙"] || {})["부칙단위"])
+    .map((u) => ({ date: String(u["부칙공포일자"] || ""), no: String(u["부칙공포번호"] || ""), lines: flattenText(u["부칙내용"]) }))
+    .sort((x, y) => (y.date + y.no.padStart(6, "0")).localeCompare(x.date + x.no.padStart(6, "0")));
+  if (!units.length) return "(이 버전 응답에 부칙 데이터가 없습니다. get_law_history로 해당 개정의 MST를 찾아 다시 조회하세요)";
+  const index = units.map((u) => `- 부칙 <제${Number(u.no) || u.no}호, ${fmtDate(u.date)}>`).join("\n");
+  let pick;
+  if (q.no) pick = units.filter((u) => Number(u.no) === Number(q.no));
+  else if (q.date) pick = units.filter((u) => u.date === q.date);
+  else pick = units.slice(0, q.latest || 3);
+  if (!pick.length) return `(지정한 부칙을 찾지 못했습니다. 이 버전에 실린 부칙 목록:)\n${index}`;
+  const body = pick.map((u) => u.lines.join("\n")).join("\n\n");
+  const head = q.no || q.date ? "" : `[최근 부칙 ${pick.length}건 — 특정 부칙은 jo='부칙 <공포번호>'로 조회]\n\n`;
+  return head + body + `\n\n[이 버전에 실린 부칙 ${units.length}건 — 최신순]\n` + index;
 }
 
 /** 조문단위 렌더링 */

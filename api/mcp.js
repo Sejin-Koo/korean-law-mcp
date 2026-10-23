@@ -291,7 +291,7 @@ const TOOLS = [
   },
   {
     name: "get_law_text",
-    description: "법령 조문 원문 조회. mst(권장, search_law의 MST) 또는 law_id로 조회. jo에 조번호를 주면 해당 조문만, 생략하면 조문 목차를 반환. 시행예정 버전 여부를 자동 표기.",
+    description: "법령 조문 원문 조회. mst(권장, search_law의 MST) 또는 law_id로 조회. jo에 조번호를 주면 해당 조문만, 생략하면 조문 목차를 반환. 본문은 시행일법령 기준이라 먼저 공포됐지만 시행이 늦은 판이 현행일 때도 그 사이 신설·개정 조문이 반영된다. 현행/연혁/시행예정을 연혁 목록으로 판정해 표기하고, 연혁 버전이면 현행 MST를 함께 안내.",
     inputSchema: {
       type: "object",
       properties: {
@@ -303,21 +303,25 @@ const TOOLS = [
     },
     handler: async (a) => {
       if (!a.mst && !a.law_id) throw new Error("mst 또는 law_id 중 하나는 필수입니다. search_law로 먼저 MST를 확인하세요.");
-      const params = { target: "law" };
-      if (a.mst) params.MST = a.mst; else params.ID = a.law_id;
       const jo = normalizeJo(a.jo);
-      if (jo) params.JO = jo;
-      const data = await drf("lawService.do", params);
-      const law = data["법령"] || {};
+      const { law, source, label, note } = await resolveLawText({ mst: a.mst, lawId: a.law_id, jo });
       const basic = law["기본정보"] || {};
-      const efYd = basic["조문별시행일자"] || basic["시행일자"];
+      const efYd = String(basic["시행일자"] || basic["조문별시행일자"] || "").replace(/[^0-9]/g, "");
+      const lawName = basic["법령명_한글"] || "";
       let head =
-        `${basic["법령명_한글"] || ""} ${statusLabel(efYd)}\n` +
+        `${lawName} ${label || statusLabel(efYd)}\n` +
         `공포 ${fmtDate(basic["공포일자"])} (${basic["제개정구분"] || ""}, 공포번호 ${basic["공포번호"] || ""}) / 시행 ${fmtDate(efYd)} / 소관 ${(basic["소관부처"] || {})["content"] || basic["소관부처명"] || ""}\n` +
         `조회기준일 ${fmtDate(todayKST())} — 위 시행일 버전의 본문입니다.` +
-        (String(efYd || "").replace(/[^0-9]/g, "") > todayKST() ? " ⚠ 이 버전은 아직 시행되지 않았습니다. 현행 조문이 필요하면 search_law에서 [현행] MST를 확인하세요." : "") + "\n\n";
+        (efYd > todayKST() ? " ⚠ 이 버전은 아직 시행되지 않았습니다. 현행 조문이 필요하면 search_law에서 [현행] MST를 확인하세요." : "") +
+        (note ? `\n${note}` : "") +
+        (source === "law" ? "\n※ 시행일법령 본문 조회에 실패해 현행법령 API 본문으로 대신 응답했습니다. 나중에 공포된 개정 조문이 빠져 있을 수 있으니 get_law_history로 개정 이력을 함께 확인하세요." : "") +
+        "\n\n";
       const units = arr((law["조문"] || {})["조문단위"]);
-      if (!units.length) return head + "(조문 데이터가 없습니다)";
+      if (!units.length) {
+        return head + (jo
+          ? `(이 시행일 버전에 해당 조문이 없습니다. 신설·삭제 여부는 get_law_history로 다른 시행일 버전과 대조하세요)`
+          : "(조문 데이터가 없습니다)");
+      }
       if (jo) {
         const body = units.map((u) => renderJo(u)).join("\n\n");
         return clip(head + body);
@@ -775,6 +779,81 @@ const TOOLS = [
     },
   },
 ];
+
+/**
+ * 조문 본문은 '시행일법령(eflaw)' API로 받는다.
+ *
+ * 왜: '현행법령(law)' API는 MST별로 공포 시점에 만들어진 본문을 돌려주므로, 먼저 공포됐지만
+ * 시행이 늦은 개정판이 [현행]으로 지정되면 그 사이에 공포·시행된 개정 조문이 빠진다.
+ * 실측(2026-10-23): 상법 [현행] MST 273629(공포 2025-09-09·시행 2026-09-10)를 law로 조회하면
+ * 2026-03-06 신설 제341조의4(자기주식 소각의무)가 "조문 없음"으로 나오지만, 같은 MST를
+ * eflaw(efYd=20260910)로 조회하면 정상 반환된다. 오류가 아닌 정상 응답이라 조용히 틀린다.
+ *
+ * eflaw는 MST만 주면 HTML 오류를 내고 efYd(시행일자)가 함께 있어야 한다. 그런데 MST 하나에
+ * 시행일이 여럿인 개정이 흔하고(예: 법인세법 MST 280349 = 시행 2026-01-01·2026-07-01),
+ * law API의 기본정보 시행일자는 그중 하나만 준다. 그래서 연혁 목록에서 그 MST의 시행일들을
+ * 모아 ①현행 표시가 붙은 시행일 ②없으면 오늘 이전 가장 늦은 시행일 ③모두 미래면 가장 이른
+ * 시행일 순으로 efYd를 고른다. 같은 목록으로 [현행]/[연혁]/[시행예정] 라벨도 정한다
+ * (statusLabel은 시행일만 봐서, 이미 대체된 과거 판도 [현행]으로 표기하던 문제가 있었다 —
+ * 실측: 상법 MST 284143 시행 2026-03-06 판).
+ *
+ * ID 경로는 eflaw가 바로 현행을 준다. eflaw가 실패하면 law 본문으로 폴백하고 응답 머리에 표기한다.
+ */
+async function lawVersions(lawName) {
+  if (!lawName) return [];
+  try {
+    const data = await drf("lawSearch.do", { target: "eflaw", query: lawName, display: 100, sort: "efdes" });
+    return arr((data.LawSearch || {}).law).filter((x) => x["법령명한글"] === lawName);
+  } catch (_) {
+    return [];
+  }
+}
+
+function pickVersion(list, mst) {
+  const mine = list.filter((x) => String(x["법령일련번호"]) === String(mst));
+  if (!mine.length) return null;
+  const today = todayKST();
+  const cur = mine.find((x) => x["현행연혁코드"] === "현행");
+  if (cur) return cur;
+  const past = mine.filter((x) => String(x["시행일자"]) <= today).sort((a, b) => String(b["시행일자"]).localeCompare(String(a["시행일자"])));
+  if (past.length) return past[0];
+  return mine.sort((a, b) => String(a["시행일자"]).localeCompare(String(b["시행일자"])))[0];
+}
+
+async function resolveLawText({ mst, lawId, jo }) {
+  const joParam = jo ? { JO: jo } : {};
+  if (!mst) {
+    try {
+      const d = await drf("lawService.do", { target: "eflaw", ID: lawId, ...joParam });
+      if (d && d["법령"]) return { law: d["법령"], source: "eflaw" };
+    } catch (_) { /* 폴백 */ }
+    const d = await drf("lawService.do", { target: "law", ID: lawId, ...joParam });
+    return { law: d["법령"] || {}, source: "law" };
+  }
+  const first = await drf("lawService.do", { target: "law", MST: mst, ...joParam });
+  const law0 = first["법령"] || {};
+  const basic0 = law0["기본정보"] || {};
+  const list = await lawVersions(basic0["법령명_한글"]);
+  const v = pickVersion(list, mst);
+  const efYd = String((v && v["시행일자"]) || basic0["시행일자"] || "").replace(/[^0-9]/g, "");
+  let label, note;
+  if (v) {
+    label = statusLabel(v["시행일자"], v["현행연혁코드"]);
+    if (v["현행연혁코드"] === "연혁") {
+      const cur = list.find((x) => x["현행연혁코드"] === "현행");
+      note = cur
+        ? `⚠ 이 버전은 연혁(과거) 버전입니다. 현행은 MST ${cur["법령일련번호"]}(공포 ${fmtDate(cur["공포일자"])} / 시행 ${fmtDate(cur["시행일자"])})입니다.`
+        : "⚠ 이 버전은 연혁(과거) 버전입니다.";
+    }
+  }
+  if (efYd.length === 8) {
+    try {
+      const d = await drf("lawService.do", { target: "eflaw", MST: mst, efYd, ...joParam });
+      if (d && d["법령"]) return { law: d["법령"], source: "eflaw", label, note };
+    } catch (_) { /* 폴백 */ }
+  }
+  return { law: law0, source: "law", label, note };
+}
 
 /** 조문단위 렌더링 */
 function renderJo(u) {

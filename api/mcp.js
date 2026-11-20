@@ -342,12 +342,23 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "법령명 (예: 법인세법)" },
+        query: { type: "string", description: "법령명 (예: 법인세법) — 법령명을 모르면 law_id 또는 mst" },
+        law_id: { type: "string", description: "법령ID(예: 000820) — query 대신. 법령명을 찾아 연혁을 조회" },
+        mst: { type: "string", description: "법령일련번호(MST) — query 대신. 법령명을 찾아 연혁을 조회" },
         display: { type: "integer", description: "버전 수 (기본 20)" },
       },
-      required: ["query"],
     },
     handler: async (a) => {
+      // 법령명 대신 법령ID·MST만 준 호출도 받는다 — 2026-11-20 업무 에이전트가 get_law_text에서 쓰던 law_id(000820)를
+      // 그대로 넘겨 '필수 인자 누락: query'로 두 번 실패. 그 법령의 기본정보에서 법령명을 찾아 같은 조회를 한다.
+      if (!a.query || !String(a.query).trim()) {
+        const id = String(a.law_id || "").trim(), mst = String(a.mst || "").trim();
+        if (!id && !mst) throw new Error("query(법령명), law_id(법령ID), mst(법령일련번호) 중 하나는 필수입니다.");
+        const d = await drf("lawService.do", Object.assign({ target: "law", JO: "000100" }, mst ? { MST: mst } : { ID: id }));
+        const name = (((d && d["법령"]) || {})["기본정보"] || {})["법령명_한글"];
+        if (!name) return `${mst ? `MST ${mst}` : `법령ID ${id}`}에 해당하는 법령을 찾지 못했습니다. search_law로 법령명을 확인해 query로 주세요.`;
+        a = Object.assign({}, a, { query: String(name).trim() });
+      }
       const data = await drf("lawSearch.do", { target: "eflaw", query: a.query, display: Math.min(a.display || 20, 100), sort: "efdes" });
       const root = data.LawSearch || {};
       const all = arr(root.law);
